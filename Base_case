@@ -1,0 +1,422 @@
+"""
+SIMPLEST BASE CASE — pivoted to continuation-value validation.
+Now with terminal re-anchoring to prevent the soft-max bias accumulation
+that was causing V to drift upward across sweeps.
+
+Problem: pure Brownian motion
+    dX = sigma dW       (zero drift)
+    Terminal reward M(x) = |x|
+    Per-step cost c*dt
+    Horizon T
+    No supremum term (yet)
+
+Key fix from previous version:
+  After each backward sweep, re-train briefly on the terminal condition
+  V(x, T) = |x|. This prevents the network from "forgetting" the anchor
+  as the backward sweeps push V values upward (a known issue with
+  soft-max targets in fitted value iteration).
+
+Also: terminal anchor is now monitored as a diagnostic — V(2, t=T) should
+stay close to 2.00 across all sweeps.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import copy
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+
+
+# ============================================================================
+# Problem
+# ============================================================================
+
+SIGMA = 1.0
+COST  = 0.2
+DT    = 0.1
+T_MAX = 2.0
+N_STEPS = int(T_MAX / DT)
+
+print(f"Problem: Brownian motion, sigma={SIGMA}, cost={COST}/step, T={T_MAX}")
+print(f"         {N_STEPS} discrete timesteps\n")
+
+
+# ============================================================================
+# Grid DP: ground-truth continuation value function V_gt(x, t)
+# ============================================================================
+
+def solve_grid_dp():
+    x_min, x_max, n_grid = -4.0, 4.0, 401
+    x_grid = np.linspace(x_min, x_max, n_grid)
+    dx = x_grid[1] - x_grid[0]
+    trans_std = SIGMA * np.sqrt(DT)
+
+    P = np.zeros((n_grid, n_grid))
+    for i in range(n_grid):
+        el = x_grid - dx / 2
+        eh = x_grid + dx / 2
+        p = norm.cdf(eh, x_grid[i], trans_std) - norm.cdf(el, x_grid[i], trans_std)
+        P[i] = p / p.sum()
+
+    V = np.zeros((N_STEPS + 1, n_grid))
+    V[-1] = np.abs(x_grid)
+    boundary = np.full(N_STEPS + 1, np.nan)
+
+    for t in range(N_STEPS - 1, -1, -1):
+        stop = np.abs(x_grid)
+        cont = P @ V[t + 1] - COST * DT
+        V[t] = np.maximum(stop, cont)
+        pos_mask = x_grid >= 0
+        diff = (stop - cont)[pos_mask]
+        cr = (diff[:-1] < 0) & (diff[1:] >= 0)
+        if cr.any():
+            idx = int(np.argmax(cr)) + 1
+            boundary[t] = x_grid[pos_mask][idx]
+    return V, boundary, x_grid
+
+
+print("[1/3] Computing ground truth via grid DP...")
+V_gt, bdy_gt, x_grid_gt = solve_grid_dp()
+print(f"       V_gt shape: {V_gt.shape} (timesteps × x-grid)")
+print(f"       ground-truth boundary: t=0 -> {bdy_gt[0]:.2f}, "
+      f"t=T/2 -> {bdy_gt[N_STEPS//2]:.2f}, t=T-1 -> {bdy_gt[N_STEPS-1]:.2f}")
+print(f"       reference: V_gt(x=0, t=0) = {V_gt[0, 200]:.3f}, "
+      f"V_gt(x=2, t=T) = {V_gt[-1, 300]:.3f}")
+
+
+# ============================================================================
+# Neural network
+# ============================================================================
+
+class ValueNet(nn.Module):
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+    def forward(self, s):
+        return self.net(s).squeeze(-1)
+
+
+def simulate(n_traj, rng):
+    X = np.zeros((n_traj, N_STEPS + 1), dtype=np.float32)
+    X[:, 0] = rng.uniform(-3.5, 3.5, n_traj).astype(np.float32)
+    for t in range(N_STEPS):
+        noise = SIGMA * np.sqrt(DT) * rng.standard_normal(n_traj).astype(np.float32)
+        X[:, t + 1] = X[:, t] + noise
+    return X
+
+
+def state_tensor(x, t_idx):
+    t_n = torch.full((x.shape[0],), t_idx / N_STEPS)
+    return torch.stack([x, t_n], dim=1).float()
+
+
+def soft_max(a, b, beta):
+    m = torch.maximum(a, b)
+    return m + torch.log(
+        torch.exp(beta * (a - m)) + torch.exp(beta * (b - m))
+    ) / beta
+
+
+# ============================================================================
+# Training with re-anchoring
+# ============================================================================
+
+def train_terminal_anchor(net, opt, n_steps=100, n_points=300):
+    """
+    (Re)train the network on the terminal condition V(x, T) = |x|.
+    Used both for initial warm start AND for re-anchoring after each
+    backward sweep, to prevent catastrophic forgetting of the terminal
+    boundary condition.
+    """
+    x_w = torch.linspace(-4, 4, n_points)
+    t_w = torch.ones_like(x_w)
+    warm_in = torch.stack([x_w, t_w], dim=1).float()
+    warm_target = torch.abs(x_w)
+    final_loss = None
+    for _ in range(n_steps):
+        p = net(warm_in)
+        l = ((p - warm_target) ** 2).mean()
+        opt.zero_grad(); l.backward(); opt.step()
+        final_loss = l.item()
+    return final_loss
+
+
+def train(net, n_sweeps=4, n_traj=3000, inner_iters=80,
+          batch_size=256, lr=1e-3,
+          beta_init=10.0, beta_final=50.0,    # bumped up to reduce bias
+          reanchor_steps=150):
+    """
+    Sequential backward induction with terminal re-anchoring.
+
+    After each backward sweep through time, retrain briefly on the
+    terminal condition to compensate for the soft-max upward bias
+    that would otherwise drag V away from the correct anchor.
+    """
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    rng = np.random.default_rng(0)
+
+    print("\n[2/3] Training neural continuation value function...")
+    print("  initial warm start at terminal V(x, T) = |x|...")
+    init_mse = train_terminal_anchor(net, opt, n_steps=600, n_points=300)
+    print(f"  initial terminal MSE: {init_mse:.5f}")
+
+    for sweep in range(n_sweeps):
+        frac = sweep / max(1, n_sweeps - 1)
+        beta = beta_init + (beta_final - beta_init) * frac
+        X = simulate(n_traj, rng)
+        X_t = torch.from_numpy(X)
+
+        # backward sweep
+        for t in range(N_STEPS - 1, -1, -1):
+            net_frozen = copy.deepcopy(net).eval()
+            stop_v = torch.abs(X_t[:, t])
+            with torch.no_grad():
+                nxt = state_tensor(X_t[:, t + 1], t + 1)
+                v_next = net_frozen(nxt)
+                cont_v = v_next - COST * DT
+            target_t = soft_max(stop_v, cont_v, beta)
+            input_t = state_tensor(X_t[:, t], t)
+
+            for _ in range(inner_iters):
+                perm = torch.randperm(n_traj)
+                for b0 in range(0, n_traj, batch_size):
+                    idx = perm[b0:b0 + batch_size]
+                    pred = net(input_t[idx])
+                    loss = ((pred - target_t[idx]) ** 2).mean()
+                    opt.zero_grad(); loss.backward(); opt.step()
+
+        # RE-ANCHOR: restore the terminal condition
+        reanchor_mse = train_terminal_anchor(net, opt, n_steps=reanchor_steps)
+
+        # diagnostics
+        net.eval()
+        with torch.no_grad():
+            v00 = net(torch.tensor([[0.0, 0.0]]).float()).item()
+            v_mid = net(torch.tensor([[2.0, 0.5]]).float()).item()
+            v_terminal_2 = net(torch.tensor([[2.0, 1.0]]).float()).item()
+            v_terminal_0 = net(torch.tensor([[0.0, 1.0]]).float()).item()
+
+        print(f"  sweep {sweep+1}/{n_sweeps}  beta={beta:5.2f}  "
+              f"V(0,t=0)={v00:.3f} (~{V_gt[0, 200]:.2f})  "
+              f"V(2,t=0.5)={v_mid:.3f}")
+        print(f"    terminal anchor: V(0,T)={v_terminal_0:.3f} (=0.00)  "
+              f"V(2,T)={v_terminal_2:.3f} (=2.00)  "
+              f"reanchor MSE={reanchor_mse:.4f}")
+
+    return net
+
+
+# ============================================================================
+# Validation
+# ============================================================================
+
+def validate_value_function(net, V_gt, x_grid_gt, verbose=True):
+    net.eval()
+    x_probe = np.linspace(-3.5, 3.5, 71).astype(np.float32)
+    idx_probe = np.array([
+        int(np.argmin(np.abs(x_grid_gt - x))) for x in x_probe
+    ])
+    t_indices = np.arange(N_STEPS + 1)
+
+    V_net_mat = np.zeros((N_STEPS + 1, len(x_probe)))
+    V_gt_mat = np.zeros((N_STEPS + 1, len(x_probe)))
+
+    for t in t_indices:
+        x_tensor = torch.from_numpy(x_probe)
+        inp = state_tensor(x_tensor, t)
+        with torch.no_grad():
+            V_net_mat[t] = net(inp).numpy()
+        V_gt_mat[t] = V_gt[t, idx_probe]
+
+    abs_err = np.abs(V_net_mat - V_gt_mat)
+    active_mask = np.abs(x_probe) < 3.0
+
+    mae_all = abs_err.mean()
+    mae_active = abs_err[:, active_mask].mean()
+    max_err = abs_err.max()
+    max_err_active = abs_err[:, active_mask].max()
+    rel_err = abs_err / (np.abs(V_gt_mat) + 0.5)
+    mean_rel = rel_err.mean()
+
+    if verbose:
+        print("\n[3/3] PRIMARY VALIDATION: V_net vs V_grid")
+        print("  " + "=" * 50)
+        print(f"  over the full state space ({(N_STEPS+1)*len(x_probe)} points):")
+        print(f"    MAE:        {mae_all:.4f}")
+        print(f"    max error:  {max_err:.4f}")
+        print(f"    mean rel:   {mean_rel:.2%}")
+        print(f"  over active region |x| < 3.0:")
+        print(f"    MAE:        {mae_active:.4f}")
+        print(f"    max error:  {max_err_active:.4f}")
+        print("\n  per-timestep MAE (active region):")
+        samples = [0, N_STEPS // 4, N_STEPS // 2, 3 * N_STEPS // 4, N_STEPS - 1, N_STEPS]
+        for t in samples:
+            mae_t = abs_err[t, active_mask].mean()
+            print(f"    t={t*DT:.2f}:  MAE = {mae_t:.4f}")
+
+    return {
+        'V_net': V_net_mat,
+        'V_gt': V_gt_mat,
+        'x_probe': x_probe,
+        'abs_err': abs_err,
+        'mae_all': mae_all,
+        'mae_active': mae_active,
+        'max_err': max_err,
+        'max_err_active': max_err_active,
+    }
+
+
+def extract_boundary_from_V(net, n_mc=500):
+    net.eval()
+    rng = np.random.default_rng(1)
+    noise_mc = torch.from_numpy(
+        (SIGMA * np.sqrt(DT) * rng.standard_normal(n_mc)).astype(np.float32)
+    )
+    x_test = torch.linspace(0.01, 4.0, 401)
+    boundary = np.full(N_STEPS + 1, np.nan)
+    for t in range(N_STEPS):
+        x_nxt = x_test[:, None] + noise_mc[None, :]
+        t_nxt = torch.full_like(x_nxt, (t + 1) / N_STEPS)
+        inp = torch.stack([x_nxt.reshape(-1), t_nxt.reshape(-1)], dim=1).float()
+        with torch.no_grad():
+            v_n = net(inp).reshape(x_nxt.shape)
+        cont_v = v_n.mean(dim=1) - COST * DT
+        stop_v = torch.abs(x_test)
+        diff = stop_v - cont_v
+        cr = (diff[:-1] < 0) & (diff[1:] >= 0)
+        if cr.any():
+            idx = int(cr.float().argmax()) + 1
+            boundary[t] = float(x_test[idx])
+    return boundary
+
+
+# ============================================================================
+# Run
+# ============================================================================
+
+torch.manual_seed(0)
+net = ValueNet()
+net = train(net, n_sweeps=4, inner_iters=80,
+            beta_init=10.0, beta_final=50.0,
+            reanchor_steps=150)
+
+results = validate_value_function(net, V_gt, x_grid_gt)
+bdy_nn = extract_boundary_from_V(net)
+
+
+# ============================================================================
+# Plots
+# ============================================================================
+
+t_axis = np.arange(N_STEPS + 1) * DT
+fig = plt.figure(figsize=(15, 10))
+gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.3)
+
+x_probe = results['x_probe']
+
+# Panel 1: V_net vs V_grid
+ax = fig.add_subplot(gs[0, 0])
+snapshots = [0, N_STEPS // 4, N_STEPS // 2, 3 * N_STEPS // 4]
+colors = plt.cm.viridis(np.linspace(0, 0.85, len(snapshots)))
+for i, t in enumerate(snapshots):
+    ax.plot(x_probe, results['V_gt'][t], "-", color=colors[i], lw=2,
+            label=f"V_grid, t={t*DT:.1f}", alpha=0.9)
+    ax.plot(x_probe, results['V_net'][t], "--", color=colors[i], lw=1.5,
+            alpha=0.7)
+ax.set_xlabel("x"); ax.set_ylabel("V(x, t)")
+ax.set_title("V_net (dashed) vs V_grid (solid)\nPRIMARY RESULT")
+ax.legend(fontsize=8, loc="upper center")
+ax.grid(alpha=0.3)
+
+# Panel 2: error heatmap
+ax = fig.add_subplot(gs[0, 1])
+im = ax.imshow(
+    results['abs_err'],
+    origin="lower", aspect="auto",
+    extent=[x_probe.min(), x_probe.max(), 0, T_MAX],
+    cmap="viridis",
+)
+plt.colorbar(im, ax=ax, label="|V_net − V_grid|")
+ax.set_xlabel("x"); ax.set_ylabel("time t")
+ax.set_title(f"V approximation error\nMAE (active) = {results['mae_active']:.3f}")
+
+# Panel 3: V_net surface
+ax = fig.add_subplot(gs[0, 2])
+im = ax.imshow(
+    results['V_net'],
+    origin="lower", aspect="auto",
+    extent=[x_probe.min(), x_probe.max(), 0, T_MAX],
+    cmap="plasma",
+)
+plt.colorbar(im, ax=ax, label="V_net(x, t)")
+ax.set_xlabel("x"); ax.set_ylabel("time t")
+ax.set_title("Learned continuation value V_net(x, t)")
+
+# Panel 4: derived boundary
+ax = fig.add_subplot(gs[1, 0])
+rng2 = np.random.default_rng(42)
+for _ in range(25):
+    Xi = [0.0]
+    for t in range(N_STEPS):
+        Xi.append(Xi[-1] + SIGMA * np.sqrt(DT) * rng2.standard_normal())
+    ax.plot(t_axis, Xi, color="gray", alpha=0.2, lw=1)
+ax.plot(t_axis, bdy_gt, "o-", color="C3", lw=2, ms=5, label="optimal (grid DP)")
+ax.plot(t_axis, -bdy_gt, "o-", color="C3", lw=2, ms=5)
+ax.plot(t_axis, bdy_nn, "s--", color="C0", lw=2, ms=4, label="derived (from V_net)")
+ax.plot(t_axis, -bdy_nn, "s--", color="C0", lw=2, ms=4)
+ax.axhline(0, color="k", lw=0.5)
+ax.set_xlabel("time t"); ax.set_ylabel("evidence x")
+ax.set_title("Stopping boundary (derived)\nSECONDARY RESULT")
+ax.legend(loc="lower center", fontsize=8); ax.grid(alpha=0.3)
+ax.set_ylim(-3.5, 3.5)
+
+# Panel 5: V_net minus stop value
+ax = fig.add_subplot(gs[1, 1])
+V_excess = results['V_net'] - np.abs(x_probe)[None, :]
+im = ax.imshow(
+    V_excess, origin="lower", aspect="auto",
+    extent=[x_probe.min(), x_probe.max(), 0, T_MAX],
+    cmap="coolwarm", vmin=-0.5, vmax=0.5,
+)
+plt.colorbar(im, ax=ax, label="V_net − |x|")
+ax.plot(t_axis, bdy_gt, "-", color="black", lw=2, label="optimal boundary")
+ax.plot(t_axis, -bdy_gt, "-", color="black", lw=2)
+ax.set_xlabel("x"); ax.set_ylabel("time t")
+ax.set_title("V_net minus stop value\n(red = continuation zone)")
+ax.legend(fontsize=8, loc="upper right")
+
+# Panel 6: per-timestep MAE
+ax = fig.add_subplot(gs[1, 2])
+active_mask = np.abs(x_probe) < 3.0
+mae_per_t = results['abs_err'][:, active_mask].mean(axis=1)
+ax.plot(t_axis, mae_per_t, "o-", color="C2", lw=2, ms=5)
+ax.set_xlabel("time t"); ax.set_ylabel("MAE |V_net − V_grid|")
+ax.set_title("V approximation error over time\n(active region |x|<3)")
+ax.grid(alpha=0.3)
+ax.set_ylim(bottom=0)
+
+plt.suptitle(
+    "Neural Continuation Value Function — with Terminal Re-anchoring\n"
+    f"Brownian motion, σ={SIGMA}, cost={COST}/step, T={T_MAX}",
+    fontsize=13, y=0.995,
+)
+
+plt.savefig("continuation_value_validation.png", dpi=130, bbox_inches="tight")
+plt.close()
+
+print("\n  saved: continuation_value_validation.png")
+print("\n" + "=" * 60)
+print("Summary:")
+print("=" * 60)
+print(f"  Primary metric (V function MAE, active region): {results['mae_active']:.4f}")
+print(f"  Goal: MAE < 0.2 indicates good convergence")
+print(f"        MAE < 0.5 acceptable, but training could improve")
+print(f"        MAE > 0.5 suggests further tuning needed")
